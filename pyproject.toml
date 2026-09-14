@@ -1,0 +1,33 @@
+[project]
+name = "classical-chessathon-engine"
+version = "1.0.0"
+description = "A classical bitboard chess engine built for AI Chessathon."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chess==1.11.2",
+    "numpy==2.5.2",
+    "numba==0.67.0",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["mypy>=1.18", "ruff>=0.14"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = ["N818"]
+
+[tool.mypy]
+strict = true
+files = [
+    "submissions/v44-volatility-pvs-candidate/agent.py",
+    "submissions/v44-volatility-pvs-candidate/core.py",
+    "harness",
+]

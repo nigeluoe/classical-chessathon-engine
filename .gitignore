@@ -1,0 +1,28 @@
+# Local Python and tool caches
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.uv-cache/
+.venv/
+.venv-cuda/
+public-release/
+
+# Generated development data and model artefacts
+training/vendor/
+training/data/
+training/models/
+*.npz
+*.onnx
+*.pt
+*.safetensors
+
+# Uploads, local analysis tools and unpublished experiment branches
+submission.zip
+submissions/*.zip
+submissions/*.pgn
+tools/
+submissions/*-candidate/
+!submissions/v44-volatility-pvs-candidate/
+!submissions/v44-volatility-pvs-candidate/agent.py
+!submissions/v44-volatility-pvs-candidate/core.py
+!submissions/v44-volatility-pvs-candidate/RESULTS.md
