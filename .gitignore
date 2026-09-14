@@ -16,13 +16,14 @@ training/models/
 *.pt
 *.safetensors
 
-# Uploads, local analysis tools and unpublished experiment branches
+# Uploads and local analysis tooling
 submission.zip
 submissions/*.zip
 submissions/*.pgn
 tools/
-submissions/*-candidate/
-!submissions/v44-volatility-pvs-candidate/
-!submissions/v44-volatility-pvs-candidate/agent.py
-!submissions/v44-volatility-pvs-candidate/core.py
-!submissions/v44-volatility-pvs-candidate/RESULTS.md
+
+# Every candidate's source is versioned. Generated per-candidate artefacts are not.
+submissions/**/dev/
+submissions/**/__pycache__/
+submissions/**/weights/
+submissions/**/tablebases/

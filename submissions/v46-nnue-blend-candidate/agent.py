@@ -1,0 +1,967 @@
+"""V46: tactical-resilience PVS engine with a conservative NNUE blend.
+
+Only the perft-tested board representation and legal move substrate live in
+``core.py``.  Move selection here is a new implementation: iterative deepening,
+principal-variation search, a transposition table, conservative selective
+pruning, threat extensions, and explicit clock management.  The engine does not ponder; the
+competition process is suspended while the opponent thinks.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import chess
+import core as c
+import numpy as np
+from numba import njit, objmode
+
+INF = 32_000
+MATE = 30_000
+MATE_TT = MATE - 128
+MAX_PLY = 96
+TT_BITS = 21
+TT_SIZE = 1 << TT_BITS
+TT_MASK = np.uint64(TT_SIZE - 1)
+TT_EXACT, TT_LOWER, TT_UPPER = 0, 1, 2
+NO_MOVE = -1
+HISTORY_LIMIT = 16_384
+CLOCK_KEY = np.uint64(0x9E3779B97F4A7C15)
+PIECE_VALUE = np.array([100, 320, 330, 500, 900, 20_000], dtype=np.int64)
+WHITE_KNIGHT_HOME = np.uint64((1 << 1) | (1 << 6))
+BLACK_KNIGHT_HOME = np.uint64((1 << 57) | (1 << 62))
+WHITE_BISHOP_HOME = np.uint64((1 << 2) | (1 << 5))
+BLACK_BISHOP_HOME = np.uint64((1 << 58) | (1 << 61))
+
+# This is our 9.8MB V45 compact network, trained from the team's stratified
+# ten-million-position corpus.  It has two 256-wide king-relative
+# accumulators and a 512 -> 32 -> 1 head.  The arrays remain integer encoded
+# in memory; accumulators are updated as moves are made and unmade, so an
+# evaluation never re-encodes the board or scans the feature table.
+NNUE_ACCUMULATOR_SIZE = 256
+NNUE_BLEND_NUMERATOR = 32  # 12.5% NNUE, 87.5% proven handcrafted score.
+NNUE_BLEND_DENOMINATOR = 256
+_NNUE_PATH = Path(__file__).with_name("v45_nnue_256_finetune_int.npz")
+with np.load(_NNUE_PATH) as _nnue_data:
+    if (
+        str(_nnue_data["format"][0]) != "v45-compact-nnue-v1"
+        or int(_nnue_data["feature_count"][0]) != 20_480
+        or int(_nnue_data["accumulator_size"][0]) != NNUE_ACCUMULATOR_SIZE
+        or int(_nnue_data["hidden_size"][0]) != 32
+    ):
+        raise RuntimeError("Incompatible V45 compact NNUE artifact")
+    NNUE_EMBEDDING = _nnue_data["embedding"].copy()
+    NNUE_EMBEDDING_SCALE = float(_nnue_data["embedding_scale"][0])
+    NNUE_HIDDEN_WEIGHT = _nnue_data["hidden_weight"].copy()
+    NNUE_HIDDEN_SCALE = float(_nnue_data["hidden_scale"][0])
+    NNUE_HIDDEN_BIAS = _nnue_data["hidden_bias"].copy()
+    NNUE_OUTPUT_WEIGHT = _nnue_data["output_weight"].copy()
+    NNUE_OUTPUT_SCALE = float(_nnue_data["output_scale"][0])
+    NNUE_OUTPUT_BIAS = float(_nnue_data["output_bias"][0])
+    NNUE_CENTIPAWN_SCALE = float(_nnue_data["centipawn_scale"][0])
+
+
+@njit(cache=False)
+def wall_time() -> float:
+    value = 0.0
+    with objmode(value="float64"):
+        value = time.perf_counter()
+    return value
+
+
+@njit(cache=False)
+def stop_requested(nodes: np.ndarray, stopped: np.ndarray, deadline: float) -> bool:
+    nodes[0] += 1
+    if (nodes[0] & 1023) == 0 and wall_time() >= deadline:
+        stopped[0] = True
+    return bool(stopped[0])
+
+
+@njit(cache=False)
+def encode_mate(score: int, ply: int) -> int:
+    if score >= MATE_TT:
+        return score + ply
+    if score <= -MATE_TT:
+        return score - ply
+    return score
+
+
+@njit(cache=False)
+def decode_mate(score: int, ply: int) -> int:
+    if score >= MATE_TT:
+        return score - ply
+    if score <= -MATE_TT:
+        return score + ply
+    return score
+
+
+@njit(cache=False)
+def drawn_material(boards: np.ndarray) -> bool:
+    heavy = boards[c.WP] | boards[c.BP] | boards[c.WR] | boards[c.BR]
+    heavy |= boards[c.WQ] | boards[c.BQ]
+    if heavy:
+        return False
+    minors = boards[c.WN] | boards[c.BN] | boards[c.WB] | boards[c.BB]
+    if c.popcount64(minors) <= 1:
+        return True
+    if boards[c.WN] | boards[c.BN]:
+        return False
+    dark = np.uint64(0xAA55AA55AA55AA55)
+    return not bool(minors & dark) or not bool(minors & ~dark)
+
+
+@njit(cache=False)
+def repeated(
+    path: np.ndarray, path_index: int, halfmove: int, root_index: int, barrier: int,
+) -> bool:
+    matches = 0
+    lower = max(barrier, path_index - halfmove)
+    for index in range(path_index - 2, lower - 1, -2):
+        if path[index] == path[path_index]:
+            matches += 1
+            # A cycle created inside this search can be repeated at will.  Before
+            # the root, two previous occurrences are required for threefold.
+            if index >= root_index or matches >= 2:
+                return True
+    return False
+
+
+@njit(cache=False)
+def static_eval(boards: np.ndarray, meta: np.ndarray) -> int:
+    base = c.eval_from_arrays(boards, meta)
+    white_adjustment = 0
+
+    # In queenful positions, putting a minor back on its original square is a
+    # real loss of time that PSTs alone understate.  The term is symmetric and
+    # naturally disappears as the relevant pieces leave their home squares.
+    if boards[c.WQ] and boards[c.BQ]:
+        white_adjustment -= 14 * c.popcount64(boards[c.WN] & WHITE_KNIGHT_HOME)
+        white_adjustment += 14 * c.popcount64(boards[c.BN] & BLACK_KNIGHT_HOME)
+        white_adjustment -= 7 * c.popcount64(boards[c.WB] & WHITE_BISHOP_HOME)
+        white_adjustment += 7 * c.popcount64(boards[c.BB] & BLACK_BISHOP_HOME)
+
+    # The substrate's shield term counts a pawn anywhere in front of the king.
+    # Correct that approximation when a king has committed to a wing: every
+    # rank the closest shelter pawn advances becomes progressively more costly.
+    for side in range(2):
+        king = c.king_square(boards, side == c.WHITE)
+        king_file, king_rank = king % 8, king // 8
+        if (king_file <= 2 or king_file >= 5) and (king_rank <= 1 or king_rank >= 6):
+            pawns = boards[c.WP if side == c.WHITE else c.BP]
+            penalty = 0
+            for file_index in range(max(0, king_file - 1), min(8, king_file + 2)):
+                on_file = pawns & c.FILE_MASKS[file_index]
+                if not on_file:
+                    continue
+                closest_advance = 7
+                while on_file:
+                    square, on_file = c.pop_lsb(on_file)
+                    advance = square // 8 - 1 if side == c.WHITE else 6 - square // 8
+                    if 0 <= advance < closest_advance:
+                        closest_advance = advance
+                penalty += 4 * closest_advance * closest_advance
+            white_adjustment += -penalty if side == c.WHITE else penalty
+
+    relative = white_adjustment if meta[0] == c.WHITE else -white_adjustment
+    return base + relative + 8  # modest side-to-move initiative
+
+
+@njit(cache=False)
+def nnue_feature(piece: int, square: int, perspective: int, king_square: int) -> int:
+    """Return this non-king piece's V45 feature for one king perspective."""
+    king_file = king_square % 8
+    king_rank = king_square // 8
+    if perspective == c.BLACK:
+        king_rank = 7 - king_rank
+    mirror_files = king_file < 4
+    if mirror_files:
+        king_file = 7 - king_file
+    bucket = king_rank * 4 + king_file - 4
+
+    file_index = square % 8
+    rank_index = square // 8
+    if perspective == c.BLACK:
+        rank_index = 7 - rank_index
+    if mirror_files:
+        file_index = 7 - file_index
+    oriented_square = rank_index * 8 + file_index
+
+    category = piece % 6
+    own_piece = (piece < 6) == (perspective == c.WHITE)
+    if not own_piece:
+        category += 5
+    return (bucket * 10 + category) * 64 + oriented_square
+
+
+@njit(cache=False)
+def nnue_add_piece(
+    boards: np.ndarray,
+    accumulators: np.ndarray,
+    embedding: np.ndarray,
+    piece: int,
+    square: int,
+    sign: int,
+) -> None:
+    """Add or remove a piece from both accumulators using the current king squares."""
+    if piece % 6 == 5:
+        return
+    for perspective in range(2):
+        king = c.king_square(boards, perspective == c.WHITE)
+        feature = nnue_feature(piece, square, perspective, king)
+        for index in range(NNUE_ACCUMULATOR_SIZE):
+            accumulators[perspective, index] += sign * int(embedding[feature, index])
+
+
+@njit(cache=False)
+def nnue_rebuild_perspective(
+    boards: np.ndarray, accumulators: np.ndarray, embedding: np.ndarray, perspective: int,
+) -> None:
+    """Rebuild one accumulator after its king moves and changes every feature ID."""
+    for index in range(NNUE_ACCUMULATOR_SIZE):
+        accumulators[perspective, index] = 0
+    king = c.king_square(boards, perspective == c.WHITE)
+    for piece in range(12):
+        if piece % 6 == 5:
+            continue
+        pieces = boards[piece]
+        while pieces:
+            square, pieces = c.pop_lsb(pieces)
+            feature = nnue_feature(piece, square, perspective, king)
+            for index in range(NNUE_ACCUMULATOR_SIZE):
+                accumulators[perspective, index] += int(embedding[feature, index])
+
+
+@njit(cache=False)
+def nnue_rebuild(boards: np.ndarray, accumulators: np.ndarray, embedding: np.ndarray) -> None:
+    nnue_rebuild_perspective(boards, accumulators, embedding, c.WHITE)
+    nnue_rebuild_perspective(boards, accumulators, embedding, c.BLACK)
+
+
+@njit(cache=False)
+def nnue_apply_move(
+    boards: np.ndarray,
+    meta: np.ndarray,
+    move: int,
+    undo: np.ndarray,
+    hash_value: np.ndarray,
+    accumulators: np.ndarray,
+    accumulator_undo: np.ndarray,
+    embedding: np.ndarray,
+) -> None:
+    """Make a move and maintain both NNUE accumulators exactly."""
+    for perspective in range(2):
+        for index in range(NNUE_ACCUMULATOR_SIZE):
+            accumulator_undo[perspective, index] = accumulators[perspective, index]
+
+    frm, to, piece, captured, promo, ep, _dbl, ck, cq = c.unpack_move(move)
+    white = meta[0] == c.WHITE
+    nnue_add_piece(boards, accumulators, embedding, piece, frm, -1)
+    if ep:
+        captured_square = to - 8 if white else to + 8
+        nnue_add_piece(boards, accumulators, embedding, captured, captured_square, -1)
+    elif captured != c.NO_PIECE:
+        nnue_add_piece(boards, accumulators, embedding, captured, to, -1)
+    placed_piece = c.promo_piece_code(promo, white) if promo else piece
+    nnue_add_piece(boards, accumulators, embedding, placed_piece, to, 1)
+    if ck:
+        rook = c.WR if white else c.BR
+        nnue_add_piece(boards, accumulators, embedding, rook, 7 if white else 63, -1)
+        nnue_add_piece(boards, accumulators, embedding, rook, 5 if white else 61, 1)
+    if cq:
+        rook = c.WR if white else c.BR
+        nnue_add_piece(boards, accumulators, embedding, rook, 0 if white else 56, -1)
+        nnue_add_piece(boards, accumulators, embedding, rook, 3 if white else 59, 1)
+
+    c.apply_move_hashed(boards, meta, move, undo, hash_value)
+    if piece % 6 == 5:
+        nnue_rebuild_perspective(
+            boards, accumulators, embedding, c.WHITE if white else c.BLACK,
+        )
+
+
+@njit(cache=False)
+def nnue_unmake_move(
+    boards: np.ndarray,
+    meta: np.ndarray,
+    undo: np.ndarray,
+    hash_value: np.ndarray,
+    accumulators: np.ndarray,
+    accumulator_undo: np.ndarray,
+) -> None:
+    c.unmake_move_hashed(boards, meta, undo, hash_value)
+    for perspective in range(2):
+        for index in range(NNUE_ACCUMULATOR_SIZE):
+            accumulators[perspective, index] = accumulator_undo[perspective, index]
+
+
+@njit(cache=False)
+def nnue_score(accumulators: np.ndarray, side: int) -> int:
+    """Run the quantised 512 -> 32 -> 1 network from side-to-move's view."""
+    ours = c.WHITE if side == c.WHITE else c.BLACK
+    theirs = c.BLACK if side == c.WHITE else c.WHITE
+    output = NNUE_OUTPUT_BIAS
+    for hidden_index in range(32):
+        total = float(NNUE_HIDDEN_BIAS[hidden_index])
+        for index in range(NNUE_ACCUMULATOR_SIZE):
+            own_value = float(accumulators[ours, index]) * NNUE_EMBEDDING_SCALE
+            enemy_value = float(accumulators[theirs, index]) * NNUE_EMBEDDING_SCALE
+            if own_value > 0.0:
+                own_weight = float(NNUE_HIDDEN_WEIGHT[hidden_index, index])
+                total += min(1.0, own_value) * own_weight * NNUE_HIDDEN_SCALE
+            if enemy_value > 0.0:
+                enemy_weight = float(
+                    NNUE_HIDDEN_WEIGHT[hidden_index, index + NNUE_ACCUMULATOR_SIZE]
+                )
+                total += min(1.0, enemy_value) * enemy_weight * NNUE_HIDDEN_SCALE
+        if total > 0.0:
+            output += total * float(NNUE_OUTPUT_WEIGHT[0, hidden_index]) * NNUE_OUTPUT_SCALE
+    return int(output * NNUE_CENTIPAWN_SCALE)
+
+
+@njit(cache=False)
+def blended_static_eval(
+    boards: np.ndarray, meta: np.ndarray, accumulators: np.ndarray,
+) -> int:
+    classical = static_eval(boards, meta)
+    neural = nnue_score(accumulators, meta[0])
+    return classical + (neural - classical) * NNUE_BLEND_NUMERATOR // NNUE_BLEND_DENOMINATOR
+
+
+@njit(cache=False)
+def attacks_enemy_major(boards: np.ndarray, square: int, moving_white: bool) -> bool:
+    """Whether the piece now on ``square`` attacks an opposing queen or rook.
+
+    This is deliberately narrower than a general threat detector.  Quiet attacks
+    on major pieces are the tactical bridges most likely to be hidden directly
+    beyond a capture-only quiescence leaf, while keeping this check cheap enough
+    to run for every quiet move in the main search.
+    """
+    enemy_major = ((boards[c.BQ] | boards[c.BR]) if moving_white
+                   else (boards[c.WQ] | boards[c.WR]))
+    if not enemy_major:
+        return False
+    piece = c.piece_at(boards, square)
+    if piece == c.NO_PIECE:
+        return False
+    piece_type = piece % 6
+    occ = c.occ_white(boards) | c.occ_black(boards)
+    attacks = np.uint64(0)
+    if piece_type == 0:
+        attacks = c.PAWN_ATTACKS_FROM[c.WHITE if moving_white else c.BLACK, square]
+    elif piece_type == 1:
+        attacks = c.KNIGHT_ATTACKS[square]
+    elif piece_type == 2:
+        attacks = c.bishop_attacks(square, occ)
+    elif piece_type == 3:
+        attacks = c.rook_attacks(square, occ)
+    elif piece_type == 4:
+        attacks = c.bishop_attacks(square, occ) | c.rook_attacks(square, occ)
+    elif piece_type == 5:
+        attacks = c.KING_ATTACKS[square]
+    return bool(attacks & enemy_major)
+
+
+@njit(cache=False)
+def exposed_king_with_heavy_attackers(boards: np.ndarray, meta: np.ndarray) -> bool:
+    """Detect the sparse pawn shield where a little extra clock is worthwhile.
+
+    This does not change evaluation.  It merely identifies positions such as the
+    analysed game: a castled king with at most one immediate shelter pawn while
+    the opponent retains both a queen and a rook.
+    """
+    white = meta[0] == c.WHITE
+    king = c.king_square(boards, white)
+    king_file, king_rank = king % 8, king // 8
+    if not (king_file <= 2 or king_file >= 5):
+        return False
+    home_rank = 0 if white else 7
+    if king_rank != home_rank:
+        return False
+    enemy_queen = boards[c.BQ] if white else boards[c.WQ]
+    enemy_rooks = boards[c.BR] if white else boards[c.WR]
+    if not enemy_queen or not enemy_rooks:
+        return False
+    pawns = boards[c.WP] if white else boards[c.BP]
+    shelter_rank = 1 if white else 6
+    shelter = 0
+    for file_index in range(max(0, king_file - 1), min(8, king_file + 2)):
+        square = shelter_rank * 8 + file_index
+        if pawns & (np.uint64(1) << np.uint64(square)):
+            shelter += 1
+    return shelter <= 1
+
+
+@njit(cache=False)
+def move_order(
+    moves: np.ndarray,
+    scores: np.ndarray,
+    count: int,
+    tt_move: int,
+    killers: np.ndarray,
+    history: np.ndarray,
+    side: int,
+    ply: int,
+) -> None:
+    for index in range(count):
+        move = int(moves[index])
+        frm, to, piece, captured, promo, _ep, _dbl, _ck, _cq = c.unpack_move(move)
+        if move == tt_move:
+            score = 20_000_000
+        elif captured != c.NO_PIECE:
+            # MVV-LVA is deliberately cheap here; SEE is used only where it can
+            # actually prune in quiescence.
+            score = 4_000_000 + 32 * PIECE_VALUE[captured % 6] - PIECE_VALUE[piece % 6]
+        elif promo:
+            score = 3_000_000 + promo * 10_000
+        elif move == killers[ply, 0]:
+            score = 2_000_000
+        elif move == killers[ply, 1]:
+            score = 1_900_000
+        else:
+            score = int(history[side, frm, to])
+        scores[index] = score
+
+
+@njit(cache=False)
+def select_move(moves: np.ndarray, scores: np.ndarray, start: int, count: int) -> int:
+    best = start
+    for index in range(start + 1, count):
+        if scores[index] > scores[best]:
+            best = index
+    moves[start], moves[best] = moves[best], moves[start]
+    scores[start], scores[best] = scores[best], scores[start]
+    return int(moves[start])
+
+
+@njit(cache=False)
+def qsearch(
+    boards: np.ndarray,
+    meta: np.ndarray,
+    hash_value: np.ndarray,
+    alpha: int,
+    beta: int,
+    ply: int,
+    nodes: np.ndarray,
+    stopped: np.ndarray,
+    deadline: float,
+    move_stack: np.ndarray,
+    score_stack: np.ndarray,
+    undo_stack: np.ndarray,
+    accumulators: np.ndarray,
+    accumulator_undo_stack: np.ndarray,
+    embedding: np.ndarray,
+    path: np.ndarray,
+    path_index: int,
+    root_index: int,
+    barrier: int,
+) -> int:
+    if stop_requested(nodes, stopped, deadline):
+        return 0
+    path[path_index] = hash_value[0]
+    if repeated(path, path_index, meta[3], root_index, barrier) or meta[3] >= 100:
+        return 0
+    if drawn_material(boards):
+        return 0
+
+    white = meta[0] == c.WHITE
+    in_check = c.square_attacked(boards, c.king_square(boards, white), not white)
+    stand = blended_static_eval(boards, meta, accumulators)
+    if ply >= MAX_PLY - 1:
+        return stand
+    if not in_check:
+        if stand >= beta:
+            return stand
+        if stand > alpha:
+            alpha = stand
+
+    moves = move_stack[ply]
+    scores = score_stack[ply]
+    undo = undo_stack[ply]
+    count = c.gen_pseudo_moves(boards, meta, moves)
+    kept = 0
+    if in_check:
+        for index in range(count):
+            move = int(moves[index])
+            _frm, _to, piece, captured, promo, _ep, _dbl, _ck, _cq = c.unpack_move(move)
+            scores[index] = (32 * PIECE_VALUE[captured % 6] - PIECE_VALUE[piece % 6]
+                             if captured != c.NO_PIECE else 0) + promo * 10_000
+    else:
+        for index in range(count):
+            move = int(moves[index])
+            frm, to, piece, captured, promo, ep, _dbl, _ck, _cq = c.unpack_move(move)
+            if captured == c.NO_PIECE and promo == 0:
+                continue
+            see = 0 if ep or promo else c.see_capture(boards, frm, to, piece, captured)
+            moves[kept] = move
+            scores[kept] = 100_000 * promo + see
+            kept += 1
+        count = kept
+
+    legal_count = 0
+    best = -MATE + ply if in_check else stand
+    for index in range(count):
+        move = select_move(moves, scores, index, count)
+        frm, to, _piece, captured, promo, _ep, _dbl, _ck, _cq = c.unpack_move(move)
+        nnue_apply_move(
+            boards, meta, move, undo, hash_value, accumulators,
+            accumulator_undo_stack[ply], embedding,
+        )
+        if c.square_attacked(boards, c.king_square(boards, white), not white):
+            nnue_unmake_move(
+                boards, meta, undo, hash_value, accumulators, accumulator_undo_stack[ply],
+            )
+            continue
+        legal_count += 1
+        gives_check = c.square_attacked(boards, c.king_square(boards, not white), white)
+        if not in_check and not gives_check:
+            gain = PIECE_VALUE[captured % 6] if captured != c.NO_PIECE else 0
+            if promo:
+                gain += PIECE_VALUE[c.promo_piece_code(promo, white) % 6] - 100
+            if stand + gain + 120 < alpha or (not ep and not promo and scores[index] < 0):
+                nnue_unmake_move(
+                    boards, meta, undo, hash_value, accumulators, accumulator_undo_stack[ply],
+                )
+                continue
+        score = -qsearch(
+            boards, meta, hash_value, -beta, -alpha, ply + 1, nodes, stopped,
+            deadline, move_stack, score_stack, undo_stack, accumulators,
+            accumulator_undo_stack, embedding, path, path_index + 1,
+            root_index, barrier,
+        )
+        nnue_unmake_move(
+            boards, meta, undo, hash_value, accumulators, accumulator_undo_stack[ply],
+        )
+        if stopped[0]:
+            return 0
+        if score > best:
+            best = score
+        if score > alpha:
+            alpha = score
+            if alpha >= beta:
+                return alpha
+    if in_check and legal_count == 0:
+        return -MATE + ply
+    return best
+
+
+@njit(cache=False)
+def search_node(
+    boards: np.ndarray,
+    meta: np.ndarray,
+    hash_value: np.ndarray,
+    depth: int,
+    alpha: int,
+    beta: int,
+    ply: int,
+    pv_node: bool,
+    allow_null: bool,
+    nodes: np.ndarray,
+    stopped: np.ndarray,
+    deadline: float,
+    tt_keys: np.ndarray,
+    tt_depths: np.ndarray,
+    tt_scores: np.ndarray,
+    tt_bounds: np.ndarray,
+    tt_moves: np.ndarray,
+    killers: np.ndarray,
+    history: np.ndarray,
+    move_stack: np.ndarray,
+    score_stack: np.ndarray,
+    undo_stack: np.ndarray,
+    accumulators: np.ndarray,
+    accumulator_undo_stack: np.ndarray,
+    embedding: np.ndarray,
+    path: np.ndarray,
+    path_index: int,
+    root_index: int,
+    barrier: int,
+    root_move: np.ndarray,
+) -> int:
+    if depth <= 0:
+        return qsearch(
+            boards, meta, hash_value, alpha, beta, ply, nodes, stopped, deadline,
+            move_stack, score_stack, undo_stack, accumulators, accumulator_undo_stack,
+            embedding, path, path_index, root_index, barrier,
+        )
+    if stop_requested(nodes, stopped, deadline):
+        return 0
+    path[path_index] = hash_value[0]
+    if ply and (repeated(path, path_index, meta[3], root_index, barrier)
+                or meta[3] >= 100 or drawn_material(boards)):
+        return 0
+    if ply >= MAX_PLY - 1:
+        return blended_static_eval(boards, meta, accumulators)
+
+    alpha = max(alpha, -MATE + ply)
+    beta = min(beta, MATE - ply - 1)
+    if alpha >= beta:
+        return alpha
+    original_alpha = alpha
+
+    key = hash_value[0] ^ (np.uint64(meta[3]) * CLOCK_KEY)
+    slot = int(key & TT_MASK)
+    tt_move = NO_MOVE
+    if tt_keys[slot] == key and tt_depths[slot] >= 0:
+        tt_move = int(tt_moves[slot])
+        if ply and not pv_node and tt_depths[slot] >= depth:
+            cached = decode_mate(int(tt_scores[slot]), ply)
+            bound = int(tt_bounds[slot])
+            if bound == TT_EXACT:
+                return cached
+            if bound == TT_LOWER and cached >= beta:
+                return cached
+            if bound == TT_UPPER and cached <= alpha:
+                return cached
+
+    white = meta[0] == c.WHITE
+    in_check = c.square_attacked(boards, c.king_square(boards, white), not white)
+    if in_check:
+        depth += 1
+    static = -INF if in_check else blended_static_eval(boards, meta, accumulators)
+
+    # Forward pruning is restricted to non-PV positions far from mate scores.
+    if not pv_node and not in_check and abs(beta) < MATE_TT:
+        if depth <= 6 and static - (80 + 85 * depth) >= beta:
+            return static
+        if depth <= 2 and static + 220 * depth < alpha:
+            razor = qsearch(
+                boards, meta, hash_value, alpha, beta, ply, nodes, stopped, deadline,
+                move_stack, score_stack, undo_stack, accumulators, accumulator_undo_stack,
+                embedding, path, path_index, root_index, barrier,
+            )
+            if razor <= alpha:
+                return razor
+
+    non_pawns = (boards[c.WN] | boards[c.WB] | boards[c.WR] | boards[c.WQ]
+                 if white else boards[c.BN] | boards[c.BB] | boards[c.BR] | boards[c.BQ])
+    if (allow_null and not pv_node and not in_check and depth >= 3 and non_pawns
+            and static >= beta and abs(beta) < MATE_TT):
+        old_side, old_ep, old_hash = meta[0], meta[2], hash_value[0]
+        if old_ep >= 0:
+            hash_value[0] ^= c.ZOBRIST_EP_FILE[old_ep % 8]
+        hash_value[0] ^= c.ZOBRIST_SIDE
+        meta[0], meta[2] = 1 - old_side, -1
+        reduction = 2 + depth // 4
+        score = -search_node(
+            boards, meta, hash_value, depth - 1 - reduction, -beta, -beta + 1,
+            ply + 1, False, False, nodes, stopped, deadline, tt_keys, tt_depths,
+            tt_scores, tt_bounds, tt_moves, killers, history, move_stack, score_stack,
+            undo_stack, accumulators, accumulator_undo_stack, embedding, path, path_index + 1,
+            root_index, path_index + 1, root_move,
+        )
+        meta[0], meta[2], hash_value[0] = old_side, old_ep, old_hash
+        if stopped[0]:
+            return 0
+        if score >= beta:
+            return score
+
+    moves = move_stack[ply]
+    scores = score_stack[ply]
+    undo = undo_stack[ply]
+    count = c.gen_pseudo_moves(boards, meta, moves)
+    if ply == 0 and root_move[0] != NO_MOVE:
+        tt_move = int(root_move[0])
+    move_order(moves, scores, count, tt_move, killers, history, meta[0], ply)
+
+    best_score = -INF
+    best_move = NO_MOVE
+    legal_count = 0
+    quiet_count = 0
+    side = int(meta[0])
+    for index in range(count):
+        move = select_move(moves, scores, index, count)
+        frm, to, _piece, captured, promo, _ep, _dbl, _ck, _cq = c.unpack_move(move)
+        quiet = captured == c.NO_PIECE and promo == 0
+        nnue_apply_move(
+            boards, meta, move, undo, hash_value, accumulators,
+            accumulator_undo_stack[ply], embedding,
+        )
+        if c.square_attacked(boards, c.king_square(boards, white), not white):
+            nnue_unmake_move(
+                boards, meta, undo, hash_value, accumulators, accumulator_undo_stack[ply],
+            )
+            continue
+        gives_check = c.square_attacked(boards, c.king_square(boards, not white), white)
+        # A quiet major-piece attack can be the non-capture bridge in an
+        # otherwise forcing exchange.  Preserve one ply for it rather than
+        # letting LMR or shallow quiet pruning hide the tactical continuation.
+        major_threat = (
+            quiet and not gives_check and depth <= 7 and attacks_enemy_major(boards, to, white)
+        )
+        legal_count += 1
+        if quiet:
+            quiet_count += 1
+
+        # Late quiets at shallow non-PV nodes have little chance of improving alpha.
+        prune = (
+            legal_count > 1
+            and not pv_node
+            and not in_check
+            and quiet
+            and not gives_check
+            and not major_threat
+            and (
+                (depth <= 3 and quiet_count > 3 + depth * depth)
+                or (depth <= 2 and static + 100 + 120 * depth <= alpha)
+            )
+        )
+        if prune:
+            nnue_unmake_move(
+                boards, meta, undo, hash_value, accumulators, accumulator_undo_stack[ply],
+            )
+            continue
+
+        child_depth = depth - 1 + (1 if major_threat else 0)
+        reduction = 0
+        if (depth >= 3 and legal_count >= 4 and quiet and not gives_check and not major_threat
+                and move != killers[ply, 0] and move != killers[ply, 1]):
+            reduction = 1
+            if depth >= 6 and legal_count >= 8:
+                reduction += 1
+            if not pv_node and depth >= 9 and legal_count >= 12:
+                reduction += 1
+            reduction = min(reduction, child_depth - 1)
+
+        if legal_count == 1:
+            score = -search_node(
+                boards, meta, hash_value, child_depth, -beta, -alpha, ply + 1,
+                pv_node, True, nodes, stopped, deadline, tt_keys, tt_depths, tt_scores,
+                tt_bounds, tt_moves, killers, history, move_stack, score_stack,
+                undo_stack, accumulators, accumulator_undo_stack, embedding, path, path_index + 1,
+                root_index, barrier, root_move,
+            )
+        else:
+            score = -search_node(
+                boards, meta, hash_value, child_depth - reduction, -alpha - 1, -alpha,
+                ply + 1, False, True, nodes, stopped, deadline, tt_keys, tt_depths,
+                tt_scores, tt_bounds, tt_moves, killers, history, move_stack, score_stack,
+                undo_stack, accumulators, accumulator_undo_stack, embedding, path, path_index + 1,
+                root_index, barrier, root_move,
+            )
+            if not stopped[0] and score > alpha and reduction:
+                score = -search_node(
+                    boards, meta, hash_value, child_depth, -alpha - 1, -alpha, ply + 1,
+                    False, True, nodes, stopped, deadline, tt_keys, tt_depths, tt_scores,
+                    tt_bounds, tt_moves, killers, history, move_stack, score_stack,
+                    undo_stack, accumulators, accumulator_undo_stack, embedding,
+                    path, path_index + 1,
+                    root_index, barrier, root_move,
+                )
+            if not stopped[0] and score > alpha and score < beta:
+                score = -search_node(
+                    boards, meta, hash_value, child_depth, -beta, -alpha, ply + 1,
+                    pv_node, True, nodes, stopped, deadline, tt_keys, tt_depths,
+                    tt_scores, tt_bounds, tt_moves, killers, history, move_stack,
+                    score_stack, undo_stack, accumulators, accumulator_undo_stack,
+                    embedding, path, path_index + 1, root_index,
+                    barrier, root_move,
+                )
+        nnue_unmake_move(
+            boards, meta, undo, hash_value, accumulators, accumulator_undo_stack[ply],
+        )
+        if stopped[0]:
+            return 0
+        if score > best_score:
+            best_score, best_move = score, move
+            if ply == 0:
+                root_move[0] = move
+        if score > alpha:
+            alpha = score
+            if alpha >= beta:
+                if quiet:
+                    if move != killers[ply, 0]:
+                        killers[ply, 1] = killers[ply, 0]
+                        killers[ply, 0] = move
+                    bonus = min(2_000, depth * depth * 24)
+                    old = int(history[side, frm, to])
+                    history[side, frm, to] = old + bonus - old * bonus // HISTORY_LIMIT
+                break
+
+    if legal_count == 0:
+        return -MATE + ply if in_check else 0
+
+    replace = tt_keys[slot] != key or depth >= tt_depths[slot] or best_score >= beta
+    if replace:
+        tt_keys[slot] = key
+        tt_depths[slot] = depth
+        tt_scores[slot] = encode_mate(best_score, ply)
+        tt_moves[slot] = best_move
+        tt_bounds[slot] = (TT_UPPER if best_score <= original_alpha
+                           else TT_LOWER if best_score >= beta else TT_EXACT)
+    return best_score
+
+
+class Engine:
+    def __init__(self) -> None:
+        self.tt_keys = np.zeros(TT_SIZE, dtype=np.uint64)
+        self.tt_depths = np.full(TT_SIZE, -1, dtype=np.int16)
+        self.tt_scores = np.zeros(TT_SIZE, dtype=np.int32)
+        self.tt_bounds = np.zeros(TT_SIZE, dtype=np.int8)
+        self.tt_moves = np.full(TT_SIZE, NO_MOVE, dtype=np.int64)
+        self.killers = np.full((MAX_PLY, 2), NO_MOVE, dtype=np.int64)
+        self.history = np.zeros((2, 64, 64), dtype=np.int32)
+        self.move_stack = np.empty((MAX_PLY, c.MAX_MOVES), dtype=np.int64)
+        self.score_stack = np.empty_like(self.move_stack)
+        self.undo_stack = np.empty((MAX_PLY, 6), dtype=np.int64)
+        self.accumulators = np.zeros((2, NNUE_ACCUMULATOR_SIZE), dtype=np.int32)
+        self.accumulator_undo_stack = np.empty(
+            (MAX_PLY, 2, NNUE_ACCUMULATOR_SIZE), dtype=np.int32,
+        )
+        self.embedding = NNUE_EMBEDDING
+        self.path = np.zeros(1024, dtype=np.uint64)
+
+    def clear(self) -> None:
+        self.tt_depths.fill(-1)
+        self.killers.fill(NO_MOVE)
+        self.history.fill(0)
+
+    def search(
+        self,
+        boards: np.ndarray,
+        meta: np.ndarray,
+        soft_seconds: float,
+        hard_seconds: float,
+        past: list[int] | None = None,
+        max_depth: int = 64,
+    ) -> tuple[int | None, int, int, int]:
+        started = time.perf_counter()
+        hard_deadline = started + hard_seconds
+        hash_value = np.array([c.compute_hash(boards, meta)], dtype=np.uint64)
+        nnue_rebuild(boards, self.accumulators, self.embedding)
+        recent = (past or [int(hash_value[0])])[-101:]
+        if not recent or recent[-1] != int(hash_value[0]):
+            recent = [int(hash_value[0])]
+        root_index = len(recent) - 1
+        self.path[:len(recent)] = recent
+
+        legal = np.empty(c.MAX_MOVES, dtype=np.int64)
+        count = c.gen_legal_moves(boards, meta, legal)
+        if count == 0:
+            return None, 0, 0, 0
+        best_move = int(legal[0])
+        best_score = 0
+        completed_depth = 0
+        nodes = np.zeros(1, dtype=np.int64)
+        stopped = np.zeros(1, dtype=np.bool_)
+        root_move = np.array([best_move], dtype=np.int64)
+        self.history //= 2
+        stable = 0
+
+        for depth in range(1, min(max_depth, MAX_PLY - 3) + 1):
+            if time.perf_counter() >= hard_deadline:
+                break
+            root_move[0] = best_move
+            width = 28 if depth >= 5 else INF
+            alpha = max(-INF, best_score - width)
+            beta = min(INF, best_score + width)
+            while True:
+                score = search_node(
+                    boards, meta, hash_value, depth, alpha, beta, 0, True, True,
+                    nodes, stopped, hard_deadline, self.tt_keys, self.tt_depths,
+                    self.tt_scores, self.tt_bounds, self.tt_moves, self.killers,
+                    self.history, self.move_stack, self.score_stack, self.undo_stack,
+                    self.accumulators, self.accumulator_undo_stack, self.embedding, self.path,
+                    root_index, root_index, 0, root_move,
+                )
+                if stopped[0] or alpha < score < beta or width >= INF:
+                    break
+                width = min(INF, width * 2)
+                alpha = max(-INF, score - width)
+                beta = min(INF, score + width)
+            if stopped[0]:
+                break
+            candidate = int(root_move[0])
+            stable = stable + 1 if candidate == best_move else 0
+            best_move, best_score, completed_depth = candidate, int(score), depth
+            if abs(best_score) >= MATE_TT:
+                break
+            elapsed = time.perf_counter() - started
+            stability_factor = 0.72 if stable >= 3 else 0.86 if stable >= 2 else 1.0
+            if elapsed >= soft_seconds * stability_factor:
+                break
+        return best_move, best_score, completed_depth, int(nodes[0])
+
+
+def time_budget(time_left_ms: int, fullmove: int, exposed_king: bool) -> tuple[float, float]:
+    remaining = max(0.0, time_left_ms / 1000.0)
+    reserve = max(0.03, min(0.30, remaining * 0.04))
+    usable = max(0.0, remaining - reserve)
+    moves_left = max(18, 38 - min(fullmove, 20))
+    soft = min(4.0, usable / moves_left + 0.025)
+    # A sparse castled shield opposite queen-and-rook pressure has a high rate
+    # of forcing tactical continuations.  Spend a bounded additional slice only
+    # there; ordinary positions retain V43/V44's proven clock behaviour.
+    if exposed_king:
+        soft = min(5.0, soft * 1.5 + 0.20)
+    hard = min(7.0, usable * 0.35, soft * 2.25)
+    return min(soft, hard), hard
+
+
+def board_hash(board: chess.Board) -> int:
+    boards, meta = c.boards_from_fen(board.fen())
+    return int(c.compute_hash(boards, meta))
+
+
+_ENGINE = Engine()
+_HISTORY: list[int] = []
+_AFTER_MOVE: chess.Board | None = None
+
+
+def observe_position(board: chess.Board) -> None:
+    global _AFTER_MOVE
+    current = board_hash(board)
+    if _AFTER_MOVE is not None:
+        for reply in list(_AFTER_MOVE.legal_moves):
+            _AFTER_MOVE.push(reply)
+            same = _AFTER_MOVE.fen() == board.fen()
+            _AFTER_MOVE.pop()
+            if same:
+                _HISTORY.append(current)
+                del _HISTORY[:-101]
+                return
+        _ENGINE.clear()
+    _HISTORY[:] = [current]
+    _AFTER_MOVE = None
+
+
+def get_move(fen: str, time_left_ms: int) -> str:
+    global _AFTER_MOVE
+    started = time.perf_counter()
+    board = chess.Board(fen)
+    legal = list(board.legal_moves)
+    if not legal:
+        return "0000"
+    observe_position(board)
+    boards, meta = c.boards_from_fen(fen)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    soft, hard = time_budget(
+        max(0, time_left_ms - elapsed_ms),
+        board.fullmove_number,
+        exposed_king_with_heavy_attackers(boards, meta),
+    )
+    chosen = legal[0]
+    score = depth = nodes = 0
+    if len(legal) > 1 and hard >= 0.004:
+        move, score, depth, nodes = _ENGINE.search(
+            boards, meta, soft, hard, past=_HISTORY,
+        )
+        if move is not None:
+            candidate = chess.Move.from_uci(c.move_to_uci(move))
+            if candidate in legal:
+                chosen = candidate
+    print(f"v46 depth={depth} nodes={nodes} score={score} move={chosen.uci()}", flush=True)
+    board.push(chosen)
+    _HISTORY.append(board_hash(board))
+    del _HISTORY[:-101]
+    _AFTER_MOVE = board
+    return chosen.uci()
+
+
+# Compile every hot signature during the now-confirmed 90 second init window.
+_warm_boards, _warm_meta = c.boards_from_fen(chess.STARTING_FEN)
+_warm_exposed_king = exposed_king_with_heavy_attackers(_warm_boards, _warm_meta)
+_warm_result = _ENGINE.search(_warm_boards, _warm_meta, 0.2, 80.0, max_depth=2)
+if _warm_result[0] is not None:
+    c.move_to_uci(_warm_result[0])
+_ENGINE.clear()

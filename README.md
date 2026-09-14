@@ -4,7 +4,7 @@ A high-performance chess engine built for **AI Chessathon**, hosted by **Optiver
 
 This repository documents a deliberately classical-engine approach. Modern top engines commonly rely on efficiently updatable neural-network evaluation (NNUE) or other neural methods. We set out to test a different proposition: how competitive can a carefully engineered, fully interpretable alpha-beta engine be when it has no neural evaluator at runtime?
 
-The result is a compact Python engine that combines bitboards, magic-bitboard attack lookups, a handcrafted tapered evaluator, and an aggressively optimised principal-variation search. The published candidate is the V44 reliability release: a classical engine whose warm-up path was hardened for the competition environment without changing its measured chess behaviour.
+The result is a compact Python engine that combines bitboards, magic-bitboard attack lookups, a handcrafted tapered evaluator, and an aggressively optimised principal-variation search. This repository preserves the complete source lineage, from the original alpha-beta baseline through 53 numbered experiments. V44 is the primary runnable classical reference because its release record is complete and its warm-up path was hardened for the competition environment.
 
 ## Project outcome
 
@@ -17,7 +17,9 @@ The project was as much an engineering exercise as a chess one. Strength improve
 
 ## What is included
 
-`submissions/v44-volatility-pvs-candidate/` contains the released engine:
+`submissions/` contains the complete, chronological experiment record. Each directory preserves the source available for that iteration; models, tablebases, generated data and upload archives are deliberately excluded. See [the evolution record](docs/EVOLUTION.md) before comparing versions: some experiments are runnable releases, while NNUE and tablebase experiments are source-preserved research snapshots whose local assets are intentionally absent.
+
+`submissions/v44-volatility-pvs-candidate/` is the primary runnable classical release:
 
 ```text
 submissions/v44-volatility-pvs-candidate/
@@ -33,7 +35,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation."""
 ```
 
-`harness/` contains the local game runner and referee used to exercise agents before release. `baselines/` contains lightweight comparison opponents. Large training corpora, caches, model artefacts, packaged uploads and intermediate candidate branches are intentionally excluded from the public release.
+`harness/` contains the local game runner and referee used to exercise agents before release. `baselines/` contains lightweight comparison opponents. Large training corpora, caches, model artefacts and packaged uploads are intentionally excluded from the public release; every iteration's source is retained.
 
 ## Engine design
 
